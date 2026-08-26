@@ -1,0 +1,6 @@
+torch
+torchvision
+easyocr
+gradio
+pillow
+numpy
