@@ -12,15 +12,18 @@ decoder emits a fixed-schema JSON object and returns per-field metadata
   with a custom **fused CUDA kernel** (`RMSNorm + residual add`) used in training.
 - **Output**: `{"company": ..., "date": ..., "address": ..., "total": ...}` plus a
   `precontext` array of per-word boxes and confidences.
+- **Checkpoint format**: [`safetensors`](https://github.com/huggingface/safetensors)
+  (`model.safetensors` + `config.json`), hosted as a model repo on the Hugging Face
+  Hub — not a pickled `.pt` file.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `mini_interfaze_receipt_extractor.ipynb` | Full training notebook (Kaggle, GPU T4x2). Trains the model and saves `mini_interfaze_checkpoint.pt`. |
-| `app.py` | Standalone Gradio inference app — loads the checkpoint, no training code needed. |
+| `mini_interfaze_receipt_extractor.ipynb` | Full training notebook (Kaggle, GPU T4x2). Trains the model, checkpoints each epoch under a disk budget, and pushes the final weights to the Hub. |
+| `app.py` | Standalone Gradio inference app — loads the checkpoint from the Hub (or a local copy), no training code needed. |
 | `requirements.txt` | Dependencies for the app. |
-| `mini_interfaze_checkpoint.pt` | Trained weights (produced by the notebook — you generate this, it isn't included here). |
+| `model.safetensors` / `config.json` | Trained weights + metadata (produced by the notebook, hosted on the Hub — see step 2). |
 
 ## 1. Train the model
 
@@ -30,9 +33,36 @@ end-to-end on a built-in synthetic receipt generator with no external dataset
 required (swap in real SROIE data by setting `SROIE_ROOT` if you've attached it
 as a Kaggle Input).
 
-The last training cell ("Save a checkpoint for deployment") writes
-`/kaggle/working/mini_interfaze_checkpoint.pt`. Download it from the **Output**
-panel on the right side of the Kaggle notebook page.
+**Checkpointing during training.** Kaggle's `/kaggle/working` output quota is
+20 GB. The notebook saves a checkpoint every epoch but rotates old ones (keeps
+the most recent 2 epochs + the best-loss epoch) so it stays well under quota no
+matter how many epochs you run — epoch count is bounded by session wall-clock,
+not disk space.
+
+**Saving the final checkpoint.** The last training cell writes the deployment
+checkpoint as **safetensors**, not `torch.save`/`.pt`:
+- `model.safetensors` — a flat tensor dict with `crnn.*`, `adapter.*`, and
+  `decoder.*` prefixed keys (safetensors can't store nested Python objects, only
+  `{str: tensor}`).
+- `config.json` — everything that isn't a tensor: image size, model dims, the
+  decoder vocab, and the field names.
+
+**Pushing to the Hub.** The final notebook cell logs in (`login()`, prompted via
+`getpass` — never hardcode a token) and uploads both files to a model repo:
+
+```python
+from huggingface_hub import HfApi
+api = HfApi()
+api.create_repo(REPO_ID, exist_ok=True)
+api.upload_folder(folder_path=CHECKPOINT_DIR, repo_id=REPO_ID)
+```
+
+This project's checkpoint is hosted at
+[`aijadugar/receipt-field-extractor`](https://huggingface.co/aijadugar/receipt-field-extractor).
+If you train your own, update `HF_REPO_ID` in `app.py` to point at your repo instead.
+
+The notebook then frees local disk (`checkpoints/` and any synthetic-data cache)
+now that the weights live on the Hub.
 
 ## 2. Deploy for free — Hugging Face Spaces
 
@@ -43,13 +73,18 @@ is fast enough for this model size.
 2. Choose:
    - **SDK**: Gradio
    - **Hardware**: CPU basic (free) — no GPU needed for inference.
-3. In the new Space's file editor (or via git), upload three files:
+3. In the new Space's file editor (or via git), upload two files:
    - `app.py` (from this folder)
    - `requirements.txt` (from this folder)
-   - `mini_interfaze_checkpoint.pt` (the file you downloaded from Kaggle in step 1)
+
+   You do **not** need to upload the checkpoint. `app.py` pulls `model.safetensors`
+   and `config.json` straight from `HF_REPO_ID` on the Hub the first time it runs.
+   (If you'd rather bundle the checkpoint directly into the Space instead of
+   fetching it from a separate model repo, you can still add `model.safetensors`
+   and `config.json` next to `app.py` — it checks for local copies first.)
 4. The Space will build automatically (installs `requirements.txt`, then runs
    `app.py`). This takes a few minutes the first time (EasyOCR downloads its
-   detector weights on first run).
+   detector weights, and the checkpoint downloads from the Hub, on first run).
 5. You'll get a public URL like `https://huggingface.co/spaces/<you>/mini-interfaze`
    — share it with anyone, no login required to use it.
 
@@ -57,7 +92,7 @@ is fast enough for this model size.
 ```bash
 git clone https://huggingface.co/spaces/<your-username>/<space-name>
 cd <space-name>
-cp /path/to/app.py /path/to/requirements.txt /path/to/mini_interfaze_checkpoint.pt .
+cp /path/to/app.py /path/to/requirements.txt .
 git add .
 git commit -m "Add Mini-Interfaze receipt extractor"
 git push
@@ -75,14 +110,19 @@ git push
 pip install -r requirements.txt
 python app.py
 ```
-Opens a local Gradio server (default `http://127.0.0.1:7860`) using the checkpoint
-in the same folder.
+Opens a local Gradio server (default `http://127.0.0.1:7860`) using either a local
+`model.safetensors`/`config.json` pair (if present next to `app.py`) or, if absent,
+the checkpoint downloaded from `HF_REPO_ID` on the Hub.
 
 ## Notes
 
 - The custom CUDA kernel (fused RMSNorm+residual) is a **training-time**
   optimization. `app.py` uses an algebraically identical pure-PyTorch fallback for
   inference, so it runs fine on the free CPU tier — no GPU required to serve it.
+- The checkpoint is **safetensors**, not a pickle. That means it can't hold
+  arbitrary Python objects (like the config dict) directly — that's why config
+  lives in a separate `config.json` next to `model.safetensors` rather than inside
+  a single `.pt` file.
 - Accuracy depends entirely on how much/what data you trained on. The notebook
   defaults to synthetic receipts for a fast, dependency-free demo; for real-world
   use, train on real photographed receipts (e.g. SROIE) for meaningfully useful

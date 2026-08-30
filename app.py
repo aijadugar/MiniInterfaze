@@ -12,9 +12,19 @@ The custom CUDA kernel used during training is NOT required for inference — th
 FusedRMSNormResidual module below automatically falls back to a numerically
 identical pure-PyTorch implementation when no CUDA device is available, which is
 the normal case on a free CPU-tier Space.
+
+Checkpoint format: safetensors, not torch.save/.pt. The model repo
+(https://huggingface.co/aijadugar/receipt-field-extractor) stores two files:
+  - model.safetensors  (flat {"crnn.<key>": tensor, "adapter.<key>": tensor,
+                                "decoder.<key>": tensor})
+  - config.json         (non-tensor metadata: dims, vocab, field names)
+If those two files aren't sitting next to app.py in the Space repo, they're
+pulled automatically from the Hub the first time load_models() runs.
 """
 
+import os
 import json
+import html
 import string
 import numpy as np
 import torch
@@ -22,11 +32,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 import gradio as gr
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_file as load_safetensors
 
 # ---------------------------------------------------------------------------
 # Config / constants (must match the training notebook)
 # ---------------------------------------------------------------------------
-CHECKPOINT_PATH = "mini_interfaze_checkpoint.pt"  # place next to this file in the Space repo
+HF_REPO_ID = "aijadugar/receipt-field-extractor"
+WEIGHTS_FILENAME = "model.safetensors"
+CONFIG_FILENAME = "config.json"
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CHARS = string.ascii_uppercase + string.digits + " .,:/-'&"
@@ -44,6 +58,7 @@ DEC_VOCAB_SIZE = len(DEC_VOCAB)
 PAD, BOS, EOS, SEP = (DEC_TOK2IDX[t] for t in SPECIAL)
 
 FIELDS = ["company", "date", "address", "total"]
+FIELD_ICONS = {"company": "🏬", "date": "📅", "address": "📍", "total": "💰"}
 
 
 def ctc_greedy_decode(logits):
@@ -219,26 +234,44 @@ class AdapterProjection(nn.Module):
 
 
 # ---------------------------------------------------------------------------
-# Load checkpoint
+# Load checkpoint (safetensors + config.json, from local files or the Hub)
 # ---------------------------------------------------------------------------
 _crnn, _adapter, _decoder, _cfg = None, None, None, None
 _reader = None
 _load_error = None
+
+
+def _resolve_file(filename):
+    """Prefer a local copy sitting next to app.py (e.g. bundled into the Space repo);
+    otherwise download it from the model repo on the Hub."""
+    if os.path.exists(filename):
+        return filename
+    return hf_hub_download(repo_id=HF_REPO_ID, filename=filename)
+
 
 def load_models():
     global _crnn, _adapter, _decoder, _cfg, _load_error
     if _crnn is not None or _load_error is not None:
         return
     try:
-        ckpt = torch.load(CHECKPOINT_PATH, map_location=DEVICE)
-        cfg = ckpt["config"]
+        weights_path = _resolve_file(WEIGHTS_FILENAME)
+        config_path = _resolve_file(CONFIG_FILENAME)
+
+        with open(config_path) as f:
+            cfg = json.load(f)
+
+        flat = load_safetensors(weights_path, device=str(DEVICE))
+        crnn_sd = {k[len("crnn."):]: v for k, v in flat.items() if k.startswith("crnn.")}
+        adapter_sd = {k[len("adapter."):]: v for k, v in flat.items() if k.startswith("adapter.")}
+        decoder_sd = {k[len("decoder."):]: v for k, v in flat.items() if k.startswith("decoder.")}
+
         _crnn = CRNN(img_h=cfg["img_h"], hidden=cfg["crnn_hidden"]).to(DEVICE)
-        _crnn.load_state_dict(ckpt["crnn_state_dict"])
+        _crnn.load_state_dict(crnn_sd)
         _adapter = AdapterProjection(cfg["crnn_hidden"], cfg["d_model"]).to(DEVICE)
-        _adapter.load_state_dict(ckpt["adapter_state_dict"])
+        _adapter.load_state_dict(adapter_sd)
         _decoder = TinyDecoder(len(cfg["dec_vocab"]), cfg["d_model"], cfg["n_heads"],
                                 cfg["n_layers"], cfg["max_len"]).to(DEVICE)
-        _decoder.load_state_dict(ckpt["decoder_state_dict"])
+        _decoder.load_state_dict(decoder_sd)
         _crnn.eval(); _adapter.eval(); _decoder.eval()
         globals()["_cfg"] = cfg
     except Exception as e:
@@ -263,15 +296,17 @@ def preprocess_crop(pil_crop, img_h=32, img_w=128):
 def extract_receipt(image: Image.Image):
     load_models()
     if _load_error is not None:
-        return ({"error": f"Model checkpoint not found or failed to load: {_load_error}. "
-                            f"Make sure '{CHECKPOINT_PATH}' is uploaded alongside app.py."},
-                [], image)
+        err = {"error": f"Model checkpoint not found or failed to load: {_load_error}. "
+                         f"Make sure '{WEIGHTS_FILENAME}' and '{CONFIG_FILENAME}' are "
+                         f"either next to app.py or available at {HF_REPO_ID} on the Hub."}
+        return err, [], image, render_field_cards(None)
 
     reader = get_detector()
     arr = np.array(image.convert("RGB"))
     results = reader.readtext(arr, detail=1, paragraph=False)
     if not results:
-        return ({"error": "No text detected in image."}, [], image)
+        err = {"error": "No text detected in image."}
+        return err, [], image, render_field_cards(None)
 
     W, H = image.size
     crops, boxes = [], []
@@ -318,38 +353,196 @@ def extract_receipt(image: Image.Image):
     annotated = image.convert("RGB").copy()
     draw = ImageDraw.Draw(annotated)
     for b, t in zip(boxes, texts):
-        draw.rectangle(b, outline="red", width=2)
-    return result, precontext, annotated
+        draw.rectangle(b, outline="#7C5CFF", width=3)
+    return result, precontext, annotated, render_field_cards(result)
 
 
 # ---------------------------------------------------------------------------
-# Gradio UI
+# UI helpers
 # ---------------------------------------------------------------------------
+def render_field_cards(result):
+    """Renders the 4 extracted fields as a small grid of styled cards instead of
+    raw JSON, so the primary result reads like a product UI, not a debug dump."""
+    if not result:
+        cards = "".join(
+            f'<div class="field-card field-card--empty">'
+            f'<div class="field-card__icon">{FIELD_ICONS.get(k, "•")}</div>'
+            f'<div class="field-card__body">'
+            f'<div class="field-card__label">{k}</div>'
+            f'<div class="field-card__value field-card__value--empty">—</div>'
+            f'</div></div>'
+            for k in FIELDS
+        )
+    else:
+        cards = "".join(
+            f'<div class="field-card">'
+            f'<div class="field-card__icon">{FIELD_ICONS.get(k, "•")}</div>'
+            f'<div class="field-card__body">'
+            f'<div class="field-card__label">{k}</div>'
+            f'<div class="field-card__value">{html.escape(v) if v else "—"}</div>'
+            f'</div></div>'
+            for k, v in result.items()
+        )
+    return f'<div class="field-grid">{cards}</div>'
+
+
 def run(image):
     if image is None:
-        return {}, [], None
-    result, precontext, annotated = extract_receipt(image)
-    return result, precontext, annotated
+        return {}, [], None, render_field_cards(None)
+    result, precontext, annotated, cards_html = extract_receipt(image)
+    return result, precontext, annotated, cards_html
 
 
-with gr.Blocks(title="Mini-Interfaze: Receipt Extractor") as demo:
-    gr.Markdown(
-        "# Mini-Interfaze — Receipt Field Extractor\n"
-        "Upload a photo of a receipt. A pretrained text detector finds the words, a small "
-        "trained CRNN reads them, and a from-scratch transformer decoder emits structured "
-        "JSON with per-word confidence (`precontext`) — a miniature version of the "
-        "*Interfaze* fused perception-and-generation architecture."
+# ---------------------------------------------------------------------------
+# Gradio UI — styled to match the Mini-Interfaze pipeline it's fronting
+# ---------------------------------------------------------------------------
+THEME = gr.themes.Soft(
+    primary_hue=gr.themes.colors.violet,
+    secondary_hue=gr.themes.colors.indigo,
+    neutral_hue=gr.themes.colors.slate,
+    font=[gr.themes.GoogleFont("Inter"), "ui-sans-serif", "system-ui", "sans-serif"],
+    font_mono=[gr.themes.GoogleFont("JetBrains Mono"), "ui-monospace", "monospace"],
+).set(
+    body_background_fill="*neutral_50",
+    block_background_fill="white",
+    block_border_width="1px",
+    block_shadow="0 1px 3px 0 rgb(0 0 0 / 0.06), 0 1px 2px -1px rgb(0 0 0 / 0.06)",
+    block_radius="16px",
+    button_primary_background_fill="linear-gradient(135deg, #7C5CFF 0%, #5B8DFF 100%)",
+    button_primary_background_fill_hover="linear-gradient(135deg, #6B4CEF 0%, #4A7CEF 100%)",
+    button_primary_text_color="white",
+)
+
+CUSTOM_CSS = """
+.app-header {
+    background: linear-gradient(135deg, #7C5CFF 0%, #5B8DFF 100%);
+    border-radius: 20px;
+    padding: 28px 32px;
+    margin-bottom: 20px;
+    color: white;
+    box-shadow: 0 8px 24px -8px rgba(124, 92, 255, 0.45);
+}
+.app-header h1 {
+    margin: 0 0 6px 0;
+    font-size: 1.65rem;
+    font-weight: 700;
+    color: white !important;
+}
+.app-header p {
+    margin: 0;
+    opacity: 0.92;
+    font-size: 0.95rem;
+    color: white !important;
+}
+.pipeline-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 14px;
+}
+.pipeline-pills span {
+    background: rgba(255, 255, 255, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.35);
+    border-radius: 999px;
+    padding: 4px 12px;
+    font-size: 0.78rem;
+    font-weight: 500;
+    backdrop-filter: blur(4px);
+}
+.field-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+}
+.field-card {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    background: #F7F5FF;
+    border: 1px solid #E7E1FF;
+    border-radius: 14px;
+    padding: 14px 16px;
+    transition: box-shadow 0.15s ease;
+}
+.field-card--empty {
+    background: #F8FAFC;
+    border: 1px dashed #E2E8F0;
+}
+.field-card__icon {
+    font-size: 1.3rem;
+    line-height: 1.4rem;
+}
+.field-card__label {
+    font-size: 0.72rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: #7C5CFF;
+    margin-bottom: 2px;
+}
+.field-card__value {
+    font-size: 1.0rem;
+    font-weight: 600;
+    color: #1E1B2E;
+    word-break: break-word;
+}
+.field-card__value--empty {
+    color: #94A3B8;
+    font-weight: 400;
+}
+.section-label {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    color: #64748B;
+    margin-bottom: 6px;
+}
+"""
+
+with gr.Blocks(title="Mini-Interfaze — Receipt Field Extractor", theme=THEME, css=CUSTOM_CSS) as demo:
+    gr.HTML(
+        """
+        <div class="app-header">
+            <h1>🧾 Mini-Interfaze — Receipt Field Extractor</h1>
+            <p>Pretrained text detector → trained CRNN recognizer → adapter projection →
+            from-scratch transformer decoder, emitting structured JSON with per-word
+            precontext (box + confidence).</p>
+            <div class="pipeline-pills">
+                <span>CRAFT Detector</span>
+                <span>CRNN + BiLSTM + CTC</span>
+                <span>Adapter Projection</span>
+                <span>Transformer Decoder</span>
+                <span>Fused RMSNorm Kernel</span>
+                <span>safetensors</span>
+            </div>
+        </div>
+        """
     )
-    with gr.Row():
-        with gr.Column():
-            inp = gr.Image(type="pil", label="Receipt photo")
-            btn = gr.Button("Extract", variant="primary")
-        with gr.Column():
-            out_json = gr.JSON(label="Structured Output")
-            out_annotated = gr.Image(label="Detected words")
-            out_precontext = gr.JSON(label="Precontext (boxes + confidence)")
 
-    btn.click(run, inputs=inp, outputs=[out_json, out_precontext, out_annotated])
+    with gr.Row(equal_height=False):
+        with gr.Column(scale=5):
+            gr.Markdown('<div class="section-label">Upload</div>')
+            inp = gr.Image(type="pil", label="Receipt photo", height=380)
+            btn = gr.Button("✨ Extract Fields", variant="primary", size="lg")
+            gr.Markdown(
+                "Works best with a clear, upright photo. First run downloads the "
+                "pretrained CRAFT detector and the checkpoint, so it may take a moment."
+            )
+
+        with gr.Column(scale=6):
+            gr.Markdown('<div class="section-label">Extracted Fields</div>')
+            field_cards = gr.HTML(render_field_cards(None))
+
+            with gr.Tabs():
+                with gr.Tab("🔍 Detected Words"):
+                    out_annotated = gr.Image(label=None, show_label=False, height=340)
+                with gr.Tab("🧠 Precontext"):
+                    out_precontext = gr.JSON(label=None, show_label=False)
+                with gr.Tab("{ } Raw JSON"):
+                    out_json = gr.JSON(label=None, show_label=False)
+
+    btn.click(run, inputs=inp, outputs=[out_json, out_precontext, out_annotated, field_cards])
 
 if __name__ == "__main__":
     demo.launch()
