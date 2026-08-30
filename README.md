@@ -1,4 +1,4 @@
-![](./assets/mi-tab.png)
+![](./assets/demo.png)
 # Mini-Interfaze: Receipt Field Extractor
 
 A small, from-scratch implementation of the *Interfaze* native-fusion pattern: a
